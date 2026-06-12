@@ -198,12 +198,12 @@ class AnthropicClient(LLMClient):
                     "budget_tokens": max(self.max_output_tokens - 1, 1024),
                 }
 
-        current_tool_name = ""
-        current_tool_id = ""
-        json_accum = ""
-        in_thinking = False
-        thinking_accum = ""
-        thinking_signature = ""
+        current_tool_name = "" # 当前工具名，空字符串表示没有正在进行的工具调用
+        current_tool_id = "" # 当前工具调用的 ID，空字符串表示没有正在进行的工具调用
+        json_accum = "" # 累积工具参数 JSON 的字符串，直到工具调用完成
+        in_thinking = False # 标记当前是否在处理 thinking block，影响事件类型的判断
+        thinking_accum = "" # 累积 thinking block 的文本，直到 thinking 完成
+        thinking_signature = "" # 累积 thinking block 的签名，直到 thinking 完成
 
         try:
             async with self._client.messages.stream(**kwargs) as stream:

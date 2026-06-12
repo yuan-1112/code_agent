@@ -1,4 +1,4 @@
-
+"""团队创建工具。"""
 
 from __future__ import annotations
 
@@ -14,11 +14,15 @@ if TYPE_CHECKING:
 
 
 class TeamCreateParams(BaseModel):
+    """TeamCreate 的输入参数。"""
+
     team_name: str
     description: str = ""
 
 
 class TeamCreateTool(Tool):
+    """创建多 agent 协作团队，并在需要时切换协调者模式。"""
+
     name = "TeamCreate"
     description = (
         "Create a new team for coordinating multiple agents.\n\n"
@@ -31,7 +35,7 @@ class TeamCreateTool(Tool):
         "## Team Workflow\n\n"
         "1. **Create a team** with TeamCreate\n"
         "2. **Spawn teammates** using the Agent tool with team_name and name parameters "
-        "— this is REQUIRED to create long-running team members\n"
+        "- this is REQUIRED to create long-running team members\n"
         "3. Teammates work independently and communicate via **SendMessage**\n"
         "4. When a teammate finishes, it sends its result to \"lead\" via SendMessage, then goes idle\n"
         "5. The lead collects and synthesizes all teammate results\n\n"
@@ -44,19 +48,18 @@ class TeamCreateTool(Tool):
         '  "description": "..."\n'
         "})\n```\n"
         "Without team_name, the agent runs as a one-shot sub-agent that blocks and returns inline "
-        "— it will NOT be a team member.\n\n"
+        "- it will NOT be a team member.\n\n"
         "## Teammate Idle State\n\n"
-        "Teammates go idle after every turn — this is completely normal. "
+        "Teammates go idle after every turn - this is completely normal. "
         "Sending a message to an idle teammate wakes them up.\n\n"
         "## Communication\n\n"
         "- Use SendMessage to talk to teammates by name\n"
         "- Messages from teammates arrive as system reminders at the start of each turn\n"
-        "- Messages are delivered automatically — you do NOT need to manually check your inbox"
+        "- Messages are delivered automatically - you do NOT need to manually check your inbox"
     )
     params_model = TeamCreateParams
     category = "command"
     is_concurrency_safe = False
-
 
     def __init__(
         self,
@@ -66,15 +69,16 @@ class TeamCreateTool(Tool):
         is_interactive: bool = True,
         enable_coordinator_mode: bool = False,
     ) -> None:
+        """保存创建团队时所需的上下文。"""
         self._team_manager = team_manager
         self._parent_agent = parent_agent
         self._teammate_mode = teammate_mode
         self._is_interactive = is_interactive
         self._enable_coordinator_mode = enable_coordinator_mode
 
-
     async def execute(self, params: BaseModel) -> ToolResult:
-        p: TeamCreateParams = params  # type: ignore[assignment]
+        """创建团队，并根据配置决定是否启用协调者模式。"""
+        team_params: TeamCreateParams = params  # type: ignore[assignment]
 
         from mewcode.teams.backend_detect import BackendDetectionError
 
@@ -82,24 +86,28 @@ class TeamCreateTool(Tool):
             backend = self._team_manager.detect_backend(
                 self._teammate_mode, self._is_interactive
             )
-        except BackendDetectionError as e:
-            return ToolResult(output=str(e), is_error=True)
+        except BackendDetectionError as exc:
+            return ToolResult(output=str(exc), is_error=True)
 
         try:
             team = self._team_manager.create_team(
-                name=p.team_name,
+                name=team_params.team_name,
                 lead_agent_id=self._parent_agent.agent_id,
-                description=p.description,
+                description=team_params.description,
                 teammate_mode=self._teammate_mode,
                 is_interactive=self._is_interactive,
             )
-        except Exception as e:
-            return ToolResult(output=f"Failed to create team: {e}", is_error=True)
+        except Exception as exc:
+            return ToolResult(output=f"Failed to create team: {exc}", is_error=True)
 
         coordinator_note = ""
         from mewcode.teams.coordinator import is_coordinator_mode
+
         if is_coordinator_mode(self._enable_coordinator_mode):
             from mewcode.agents.tool_filter import apply_coordinator_filter
+
+            # 协调者模式下，主 agent 的工具集会被缩窄为“调度优先”版本，
+            # 原完整 registry 通过 _full_registry 暂存起来，便于团队解散时恢复。
             self._parent_agent.coordinator_mode = True
             self._parent_agent._team_manager = self._team_manager
             self._parent_agent._full_registry = self._parent_agent.registry

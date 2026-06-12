@@ -1,4 +1,9 @@
+"""文件读取工具。
 
+这个工具是文件编辑链路里的第一步。
+它负责把文件内容读出来、按行编号返回，并在需要时把读取结果写入
+FileStateCache，为后续 WriteFile / EditFile 的安全检查提供依据。
+"""
 
 from __future__ import annotations
 
@@ -15,25 +20,46 @@ if TYPE_CHECKING:
 
 
 class Params(BaseModel):
+    """ReadFile 的输入参数。"""
+
     file_path: str = Field(description="Absolute or relative path to the file to read")
     offset: int = Field(default=0, description="Line offset to start reading from (0-based)")
     limit: int = Field(default=2000, description="Maximum number of lines to read")
 
 
 class ReadFile(Tool):
+    """读取文件并返回带行号的文本内容。"""
+
     name = "ReadFile"
     description = "Read a file and return its contents with line numbers."
     params_model = Params
     category = "read"
     is_concurrency_safe = True
 
+    def __init__(
+        self,
+        file_cache: FileCache | None = None,
+        file_state_cache: FileStateCache | None = None,
+    ) -> None:
+        """保存可选的缓存组件。
 
-    def __init__(self, file_cache: FileCache | None = None, file_state_cache: FileStateCache | None = None) -> None:
+        输入:
+            file_cache: 文件内容缓存，可减少重复读盘。
+            file_state_cache: 文件状态缓存，用于后续写操作的安全门。
+        """
         self._cache = file_cache
         self._state_cache = file_state_cache
 
-
     async def execute(self, params: Params) -> ToolResult:
+        """读取目标文件，并按 offset/limit 截取结果返回。
+
+        输入:
+            params.file_path: 目标文件路径。
+            params.offset: 起始行偏移。
+            params.limit: 最大返回行数。
+        输出:
+            ToolResult，内容为“行号 + 制表符 + 原始行文本”的多行字符串。
+        """
         path = Path(params.file_path)
         if not path.exists():
             return ToolResult(output=f"Error: file not found: {params.file_path}", is_error=True)
@@ -43,22 +69,25 @@ class ReadFile(Tool):
         resolved = str(path.resolve())
 
         try:
+            # 先尝试命中文件内容缓存，只有缓存未命中时才真正读盘。
             text = self._cache.get(resolved) if self._cache else None
             if text is None:
                 text = path.read_text(encoding="utf-8")
                 if self._cache:
                     self._cache.put(resolved, text)
-        except Exception as e:
-            return ToolResult(output=f"Error reading file: {e}", is_error=True)
+        except Exception as exc:
+            return ToolResult(output=f"Error reading file: {exc}", is_error=True)
 
         if self._state_cache:
             try:
+                # 读成功后立刻记录内容与 mtime，供后续“先读后改”校验使用。
                 mtime_ns = path.stat().st_mtime_ns
                 self._state_cache.record(resolved, text, mtime_ns)
             except OSError:
+                # 记录状态失败不会影响读文件本身，只是后续安全校验会少一层保障。
                 pass
 
         lines = text.splitlines()
-        selected = lines[params.offset : params.offset + params.limit]
+        selected = lines[params.offset: params.offset + params.limit]
         numbered = [f"{i + params.offset + 1}\t{line}" for i, line in enumerate(selected)]
         return ToolResult(output="\n".join(numbered))

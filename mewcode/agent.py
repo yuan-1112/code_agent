@@ -1,4 +1,10 @@
 
+"""Agent 主循环实现。
+
+这个文件负责把对话、模型、工具、权限、上下文压缩、Hook、记忆等能力
+编排成一条完整的 Agent Loop。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -55,8 +61,11 @@ from mewcode.tools.base import (
 
 log = logging.getLogger(__name__)
 
+# 记忆提取不是每轮都执行，而是周期性后台触发。
 MEMORY_EXTRACTION_INTERVAL = 5
+# 当输出被 max_tokens 截断时，优先把输出上限提升到这个值。
 MAX_TOKENS_CEILING = 64000
+# 输出截断后的恢复重试次数上限。
 MAX_OUTPUT_TOKENS_RECOVERIES = 3
 
 
@@ -66,22 +75,26 @@ MAX_OUTPUT_TOKENS_RECOVERIES = 3
 
 @dataclass
 class StreamText:
+    """模型正文文本的流式增量事件。"""
     text: str
 
 
 @dataclass
 class ThinkingText:
+    """模型思考内容的流式增量事件。"""
     text: str
 
 
 @dataclass
 class RetryEvent:
+    """通知外层当前轮次需要重试。"""
     reason: str
     wait: float = 0.0
 
 
 @dataclass
 class ToolUseEvent:
+    """通知外层：模型已经确定了一次完整工具调用。"""
     tool_name: str
     tool_id: str
     arguments: dict[str, Any]
@@ -89,6 +102,7 @@ class ToolUseEvent:
 
 @dataclass
 class ToolResultEvent:
+    """通知外层：某次工具调用已经执行完毕。"""
     tool_id: str
     tool_name: str
     output: str
@@ -98,36 +112,42 @@ class ToolResultEvent:
 
 @dataclass
 class TurnComplete:
+    """通知外层：当前 turn 已完成。"""
     turn: int
 
 
 @dataclass
 class LoopComplete:
+    """通知外层：整个 Agent Loop 已结束。"""
     total_turns: int
 
 
 @dataclass
 class UsageEvent:
+    """累计 token 使用量更新事件。"""
     input_tokens: int
     output_tokens: int
 
 
 @dataclass
 class ErrorEvent:
+    """统一错误事件。"""
     message: str
 
 
 @dataclass
 class CompactNotification:
+    """上下文压缩通知事件。"""
     before_tokens: int
     message: str
-    # 结构化 boundary（摘要 + 原文保留尾部），UI/session 层用它持久化 compact_boundary 记录。
-    # 失败路径下为 None。
+    # boundary 保存本次 compact 的结构化边界信息，
+    # 便于 UI 或 session 层记录“哪些内容被摘要，哪些尾部被保留”。
     boundary: "CompactBoundary | None" = None
 
 
 @dataclass
 class HookEvent:
+    """Hook 执行结果事件。"""
     hook_id: str
     event: str
     output: str
@@ -135,6 +155,7 @@ class HookEvent:
 
 
 class PermissionResponse(Enum):
+    """用户对权限请求的响应类型。"""
     ALLOW = "allow"
     DENY = "deny"
     ALLOW_ALWAYS = "allow_always"
@@ -142,6 +163,7 @@ class PermissionResponse(Enum):
 
 @dataclass
 class PermissionRequest:
+    """请求外层代为确认权限的事件。"""
     tool_name: str
     description: str
     future: asyncio.Future[PermissionResponse]
@@ -169,12 +191,14 @@ AgentEvent = (
 
 @dataclass
 class ThinkingBlock:
+    """一段完整 thinking block 的内部表示。"""
     thinking: str
     signature: str
 
 
 @dataclass
 class LLMResponse:
+    """一次 LLM 调用结束后，Agent 真正关心的结构化结果。"""
     text: str = ""
     tool_calls: list[ToolCallComplete] = field(default_factory=list)
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
@@ -186,14 +210,24 @@ class LLMResponse:
 
 
 class StreamCollector:
+    """消费底层 StreamEvent，并同步构建 LLMResponse。
+
+    这个类的作用是：
+    1. 边读模型流，边把可展示事件往外 yield。
+    2. 边把文本、thinking、tool_calls、usage 累积到完整 response 中。
+    """
+
     def __init__(self) -> None:
+        """初始化一个空的响应容器。"""
         self.response = LLMResponse()
 
     async def consume(
         self, stream: AsyncIterator[StreamEvent]
     ) -> AsyncIterator[AgentEvent]:
+        """消费底层模型流，并转换成 Agent 级事件。"""
         async for event in stream:
             if isinstance(event, TextDelta):
+                # 文本既要实时透传给外层，也要累积到完整 response 中。
                 self.response.text += event.text
                 yield StreamText(text=event.text)
             elif isinstance(event, ThinkingDelta):
@@ -203,6 +237,8 @@ class StreamCollector:
                     ThinkingBlock(thinking=event.thinking, signature=event.signature)
                 )
             elif isinstance(event, ToolCallStart):
+                # Agent 层当前不透传工具开始/参数增量，
+                # 这里只在内部等待完整 ToolCallComplete。
                 pass
             elif isinstance(event, ToolCallDelta):
                 pass
@@ -227,6 +263,7 @@ class StreamCollector:
 
 @dataclass
 class ToolBatch:
+    """同一批需要一起执行的工具调用。"""
     concurrent: bool
     calls: list[ToolCallComplete]
 
@@ -235,6 +272,7 @@ def partition_tool_calls(
     tool_calls: list[ToolCallComplete],
     registry: ToolRegistry,
 ) -> list[ToolBatch]:
+    """按并发安全性切分工具调用列表。"""
     batches: list[ToolBatch] = []
     for tc in tool_calls:
         tool = registry.get(tc.tool_name)
@@ -253,6 +291,7 @@ def partition_tool_calls(
 
 @dataclass
 class _ToolExecResult:
+    """单次工具执行的内部结果对象。"""
     tool_id: str
     tool_name: str
     result: ToolResult
@@ -261,7 +300,10 @@ class _ToolExecResult:
 
 
 class StreamingExecutor:
+    """收集并等待多项并发工具任务完成。"""
+
     def __init__(self) -> None:
+        """初始化任务列表与提交顺序计数器。"""
         self._tasks: list[tuple[int, asyncio.Task[_ToolExecResult]]] = []
         self._order = 0
 
@@ -269,11 +311,13 @@ class StreamingExecutor:
         self,
         coro: Any,
     ) -> None:
+        """提交一个 coroutine，并立刻包装成 asyncio task 调度执行。"""
         task = asyncio.create_task(coro)
         self._tasks.append((self._order, task))
         self._order += 1
 
     async def collect_results(self) -> list[_ToolExecResult]:
+        """按提交顺序收集所有并发任务结果。"""
         if not self._tasks:
             return []
         tasks = [t for _, t in sorted(self._tasks, key=lambda x: x[0])]
@@ -311,57 +355,101 @@ class Agent:
         memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
     ) -> None:
+        """初始化 Agent 运行时依赖与状态。"""
+        # 驱动循环核心三件套：LLM 客户端
         self.client = client
+        # 驱动循环核心三件套：工具注册表，包含当前可用工具
         self.registry = registry
+        # 驱动循环核心三件套：通信协议版本标识
         self.protocol = protocol
+        
+        # 当前所在的系统工作目录
         self.work_dir = work_dir
+        # 防止 Agent 死循环失控，设置保守的默认值（如 50 次最大迭代）
         self.max_iterations = max_iterations
+        
+        # 权限检查器，负责拦截需要用户人工确认的敏感/危险操作
         self.permission_checker = permission_checker
+        # 全局权限模式（从检查器中承接，默认走 DEFAULT 交互模式）
         self.permission_mode: PermissionMode = (
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
         )
+        
+        # 大语言模型允许最大的总计上下文窗口 token 长度
         self.context_window = context_window
+        # 当前对话在本地持久化存放记录与快照的缓存目录
         self.session_dir = ensure_session_dir(work_dir)
+        
+        # 上下文压缩的重试熔断器，防止压缩反复失败时陷入死循环
         self.compact_breaker = CompactCircuitBreaker()
+        # 长文本/返回结果的“文件外置替换”记录表，减少占用核心 prompt token
         self.replacement_state: ContentReplacementState = create_replacement_state()
-        # 保存重建工作上下文所需的快照，在 Layer 2 压缩对话后使用：
-        # 最近的文件读取和 skill 调用。每次 ReadFile / skill 调用时记录，
-        # auto_compact 触发阈值时消费。
+        # recovery_state 用于保存“上下文被压缩后仍可能需要重新补回的信息快照”，
+        # 例如最近 ReadFile 读过的文件内容、最近使用过的 skill 信息等。
         self.recovery_state: RecoveryState = RecoveryState()
+        
+        # 追踪整个 session 生命周期内的输入消耗 token 总量
         self.total_input_tokens = 0
+        # 追踪整个 session 生命周期内的输出生成 token 总量
         self.total_output_tokens = 0
+        
+        # Agent 的行为准则、人设等静态 instructions 内容
         self.instructions_content = instructions_content
+        # 长期记忆管理器，用于读取知识库档案或者对历史关键信息抽入归档
         self.memory_manager = memory_manager
+        # Hook 拦截与通知引擎，用于编排第三方接入扩展或生命周期的事件响应
         self.hook_engine = hook_engine
+        
+        # 追踪主循环完成的回合数，触发诸如定期记忆提取等动作
         self._loop_count = 0
+        # 防护标：标识系统是否正在异步解析、提取过去信息的记忆摘要
         self._extracting = False
+        
+        # UI/上层传入的用来挂载当前记录与存储归属的 Session ID
         self.session_id: str = ""
+        # 管理当前已经被加载/激活到运行环境的特殊技能（Skill）提示词正文
         self.active_skills: dict[str, str] = {}
+        # 向 LLM 投喂的“全部可用 Skill 描述说明目录”文本
         self._skill_catalog: str = ""
+        # 向 LLM 投喂的“当前团队内其他 Agent 同事可被召唤调用的介绍”文案
         self._agent_catalog: str = ""
+        # 其他 Agent 可被召唤信息的结构化列表记录
         self._agent_catalog_list: list[tuple[str, str]] = []
+        
+        # 给当前 Agent 对象生成的唯一标识符（常用 12 位 uuid）
         self.agent_id: str = uuid.uuid4().hex[:12]
+        # 指向拉起当前 Agent 的父级协调者 Agent ID（单体工作时为 None）
         self.parent_id: str | None = None
+        # 日志可观测系统中用于把整个事件串成一串的链路 Trace ID
         self.trace_id: str | None = None
+        
+        # 标记当前 Agent 是否属于“团队总协调者”（这会影响它的系统提示与职能）
         self.coordinator_mode: bool = False
+        # 多 Agent 协同模式下共建群组所在的虚拟办公团队信箱名称
         self.team_name: str = ""
+        # 控制跨 Agent 生命周期、信差派发管理的对象实例
         self._team_manager: Any = None
+        # 供外部推回给当前 Agent 的通知回调，如背景构建任务的成功反馈
         self.notification_fn: Callable[[], list[str]] | None = None
+        # 用于保存各个时间节点文件快照变更的历史追踪器
         self.file_history: Any = None
 
     @property
     def _transcript_path(self) -> str:
+        """返回当前 session 对应的 transcript 文件路径。"""
         if self.session_id:
             return str(Path(self.work_dir) / ".mewcode" / "sessions" / f"{self.session_id}.jsonl")
         return ""
 
     @property
     def plan_mode(self) -> bool:
+        """判断当前是否处于计划模式。"""
         return self.permission_mode == PermissionMode.PLAN
 
     _plan_path_cache: Path | None = None
 
     def _get_plan_path(self) -> Path:
+        """生成或复用计划模式下的计划文件路径。"""
         if self._plan_path_cache is not None:
             return self._plan_path_cache
         import random
@@ -380,26 +468,32 @@ class Agent:
         return self._plan_path_cache
 
     def set_permission_mode(self, mode: PermissionMode) -> None:
+        """同步更新 Agent 与 PermissionChecker 的权限模式。"""
         self.permission_mode = mode
         if self.permission_checker:
             self.permission_checker.mode = mode
 
     def activate_skill(self, name: str, prompt_body: str) -> None:
+        """激活一个 skill，并保存其提示词正文。"""
         self.active_skills[name] = prompt_body
 
     def clear_active_skills(self) -> None:
+        """清空当前已激活的 skill。"""
         self.active_skills.clear()
 
     def set_skill_catalog(self, catalog: str) -> None:
+        """设置当前可见的 skill 目录说明文本。"""
         self._skill_catalog = catalog
 
 
     def set_agent_catalog(self, catalog: str, catalog_list: list[tuple[str, str]] | None = None) -> None:
+        """设置当前可见的 agent 类型目录说明。"""
         self._agent_catalog = catalog
         if catalog_list is not None:
             self._agent_catalog_list = catalog_list
 
     def _build_hook_context(self, event: str, **kwargs: str | dict) -> HookContext:
+        """构造传给 Hook 系统的统一上下文对象。"""
         return HookContext(
             event_name=event,
             tool_name=str(kwargs.get("tool_name", "")),
@@ -410,9 +504,11 @@ class Agent:
         )
 
     def _infer_file_path(self, args: dict) -> str:
+        """从工具参数中尽量推断出文件路径字段。"""
         return str(args.get("file_path", args.get("path", "")))
 
     def _drain_hook_events(self) -> list[HookEvent]:
+        """把 HookEngine 中暂存的通知取出并转成 HookEvent。"""
         if not self.hook_engine:
             return []
         return [
@@ -426,12 +522,15 @@ class Agent:
         ]
 
     async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        """完整交互模式下的 Agent 主循环。"""
         self._current_conversation = conversation
+        # 环境上下文让模型了解当前工作目录、激活的 skill、可见的 agent 类型等。
         env_context = build_environment_context(
             self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
         )
         conversation.inject_environment(env_context)
 
+        # 长期记忆与静态说明会一起注入，形成比单轮消息更稳定的背景上下文。
         memory_content = self.memory_manager.load() if self.memory_manager else ""
         conversation.inject_long_term_memory(self.instructions_content, memory_content)
 
@@ -466,7 +565,8 @@ class Agent:
                 for note in self.notification_fn():
                     conversation.add_system_reminder(note)
 
-            # Layer 2: 接近 context window 上限时自动 compact（操作原始对话）
+            # Layer 2：真正发模型请求前，先判断是否需要压缩原始对话历史，
+            # 避免上下文窗口被撑爆。
             compact_result = await auto_compact(
                 conversation,
                 self.client,
@@ -534,9 +634,8 @@ class Agent:
 
             tools = self.registry.get_all_schemas(self.protocol)
 
-            # Layer 1: 在 LLM 调用前应用 tool-result budget，确保 api_conv 反映
-            # 本轮迭代中所有已发生的写入（system reminders、hook 通知等）。
-            # 原始 conversation 不会被修改；替换决策保存在 self.replacement_state 中。
+            # Layer 1：对过长 tool_result 做预算控制。
+            # 这里不会直接改原始 conversation，而是生成一个专供本轮模型调用的 api_conv。
             api_conv, _new_records = apply_tool_result_budget(
                 conversation, self.session_dir, self.replacement_state
             )
@@ -569,6 +668,7 @@ class Agent:
             ]
 
             if response.stop_reason == "max_tokens":
+                # 输出被截断时，优先尝试放宽上限或提示模型从中断处继续写。
                 if not max_tokens_escalated:
                     self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
                     max_tokens_escalated = True
@@ -599,6 +699,7 @@ class Agent:
                 output_recoveries = 0
 
             if not response.tool_calls:
+                # 没有工具调用，说明模型已经给出了最终回答，本轮也是最后一轮。
                 conversation.add_assistant_message(
                     response.text, thinking_blocks=conv_thinking
                 )
@@ -632,9 +733,8 @@ class Agent:
             conversation.add_assistant_message(
                 response.text, tool_uses, thinking_blocks=conv_thinking
             )
-            # 在 assistant 回复加入历史后锚定实际用量：基线（input + cache + output）
-            # 覆盖到当前位置，因此下一轮迭代顶部的 auto-compact 检查只需对
-            # 接下来追加的 tool results 做字符估算。
+            # assistant 回复已经入历史后，把这一轮真实 token 用量锚定下来，
+            # 下一轮 compact 或预算估算时就不需要重新猜测这段回复的成本。
             conversation.record_usage_anchor(
                 response.input_tokens,
                 response.output_tokens,
@@ -779,6 +879,7 @@ class Agent:
 
 
     def _consume_mailbox(self, conversation: ConversationManager) -> None:
+        """把团队邮箱中的新消息注入到当前对话。"""
         if not self.team_name or not self._team_manager:
             return
         try:
@@ -796,6 +897,7 @@ class Agent:
             log.debug("Mailbox consumption failed: %s", e)
 
     def _build_permission_description(self, tc: ToolCallComplete) -> str:
+        """为权限弹窗构造更适合人类阅读的描述文本。"""
         if tc.tool_name == "Bash":
             return tc.arguments.get("command", tc.tool_name)
         if tc.tool_name in ("ReadFile", "WriteFile", "EditFile"):
@@ -805,6 +907,7 @@ class Agent:
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
     ) -> _ToolExecResult:
+        """直接执行单个工具，不经过交互式权限请求流程。"""
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
 
@@ -848,12 +951,14 @@ class Agent:
     async def _execute_batch_parallel(
         self, calls: list[ToolCallComplete]
     ) -> list[_ToolExecResult]:
+        """并发执行一整批允许并发的工具调用。"""
         tasks = [self._execute_single_tool_direct(tc) for tc in calls]
         return list(await asyncio.gather(*tasks))
 
     async def _execute_tool(
         self, tc: ToolCallComplete
     ) -> AsyncIterator[tuple[ToolResult, float, bool]]:
+        """执行单个工具，并在必要时先向外发出 PermissionRequest。"""
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
         is_unknown = False
@@ -876,7 +981,7 @@ class Agent:
             yield result, elapsed, is_unknown
             return
 
-        # 权限检查
+        # 权限检查分三种结果：deny / ask / allow。
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
 
@@ -893,7 +998,7 @@ class Agent:
                 loop = asyncio.get_running_loop()
                 future: asyncio.Future[PermissionResponse] = loop.create_future()
                 desc = self._build_permission_description(tc)
-                # 向调用方 yield 权限请求事件，由调用方处理
+                # 这里先把权限请求事件抛给外层，真正是否继续执行要等待外层回填 future。
                 yield PermissionRequest(
                     tool_name=tc.tool_name,
                     description=desc,
@@ -937,9 +1042,12 @@ class Agent:
     def _snapshot_for_recovery(
         self, tc: ToolCallComplete, result: ToolResult
     ) -> None:
-        """捕获 ReadFile 刚交给模型的内容，以便 Layer 2 压缩对话后
-        auto_compact 能重新附加这些数据。每次 ReadFile 多一次磁盘读取，
-        比从 tool 输出中反向解析行号要划算。
+        """为后续上下文恢复保存关键快照。
+
+        当前主要处理 ReadFile：
+        - 当 ReadFile 成功后，重新读取原文件完整内容。
+        - 把“路径 -> 内容”的映射记录到 recovery_state。
+        - 这样即使后面 auto_compact 压掉了旧对话，也还能把最近读过的关键文件补回去。
         """
         if result.is_error or tc.tool_name != "ReadFile":
             return
@@ -956,6 +1064,7 @@ class Agent:
     async def _extract_memories(
         self, conversation: ConversationManager
     ) -> None:
+        """异步触发长期记忆提取。"""
         if self._extracting or not self.memory_manager:
             return
         self._extracting = True
@@ -971,10 +1080,10 @@ class Agent:
     async def manual_compact(
         self, conversation: ConversationManager
     ) -> CompactNotification | ErrorEvent:
-        # auto_compact 会用摘要替换 conversation.history，所有 tool-result 内容
-        # （原始或已替换的）都将被丢弃。这里跳过 apply_tool_result_budget —
-        # 它在主循环中的唯一目的是为 LLM 调用生成 api_conv，而本路径不需要
-        # 发起看到替换结果的 LLM 调用（auto_compact 内部的摘要调用操作的是原始对话）。
+        """手动触发一次上下文压缩。"""
+        # 与主循环不同，这里不会先走 apply_tool_result_budget。
+        # manual_compact 的目标是“直接压原始对话历史”，而不是为即将发生的
+        # 某次模型调用生成精简版 api_conv。
         result = await auto_compact(
             conversation,
             self.client,
@@ -1007,6 +1116,7 @@ class Agent:
         self, task: str, conversation: ConversationManager | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        """非交互模式下同步跑完整个任务，并返回最终文本。"""
         if conversation is None:
             conversation = ConversationManager()
 
@@ -1086,6 +1196,7 @@ class Agent:
             collector = StreamCollector()
             llm_stream = self.client.stream(api_conv, system=system, tools=tools)
             async for _event in collector.consume(llm_stream):
+                # 非交互路径不逐个向外透传事件，只在 collector 内部累积完整结果。
                 pass
 
             response = collector.response
@@ -1131,8 +1242,7 @@ class Agent:
                 for tc in response.tool_calls
             ]
             conversation.add_assistant_message(response.text, tool_uses)
-            # assistant 回复已在历史中，锚定实际用量；下一轮迭代只需对
-            # 下方追加的 tool results 做字符估算。
+            # 与 run() 相同，这里也要在 assistant 回复入历史后锚定真实 token 成本。
             conversation.record_usage_anchor(
                 response.input_tokens,
                 response.output_tokens,
@@ -1169,6 +1279,7 @@ class Agent:
     async def _execute_tool_noninteractive(
         self, tc: ToolCallComplete
     ) -> ToolResult:
+        """非交互路径下执行单个工具。"""
         tool = self.registry.get(tc.tool_name)
 
         if tool is None:
@@ -1206,7 +1317,8 @@ class Agent:
                 )
             if decision.effect == "ask":
                 if self.permission_mode == PermissionMode.DONT_ASK:
-                    pass  # 自动批准
+                    # 非交互 agent 无法真的弹窗提问，这里只能把 dontAsk 当作自动批准。
+                    pass
                 else:
                     return ToolResult(
                         output="Permission denied: non-interactive agent cannot prompt user",
@@ -1238,6 +1350,7 @@ class Agent:
         return result
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
+        """控制工具输出写回对话前的体积。"""
         from mewcode.context.manager import (
             SINGLE_RESULT_CHAR_LIMIT,
             make_persisted_preview,

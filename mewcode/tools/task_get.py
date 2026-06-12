@@ -1,4 +1,4 @@
-
+"""团队共享任务详情查询工具。"""
 
 from __future__ import annotations
 
@@ -13,32 +13,36 @@ if TYPE_CHECKING:
 
 
 class TaskGetParams(BaseModel):
+    """TaskGet 的输入参数。"""
+
     task_id: str
 
 
 class TaskGetTool(Tool):
+    """按任务 ID 查询共享任务详情。"""
+
     name = "TaskGet"
     description = "Get details of a shared task by ID, including dependency information."
     params_model = TaskGetParams
     category = "read"
     is_concurrency_safe = True
 
-
     def __init__(self, team_manager: TeamManager, team_name: str) -> None:
+        """保存团队上下文。"""
         self._team_manager = team_manager
         self._team_name = team_name
 
-
     async def execute(self, params: BaseModel) -> ToolResult:
-        p: TaskGetParams = params  # type: ignore[assignment]
+        """读取单个任务详情，并整理成可读文本。"""
+        task_params: TaskGetParams = params  # type: ignore[assignment]
 
         store = self._team_manager.get_task_store(self._team_name)
         if store is None:
             return ToolResult(output=f"Task store not found for team '{self._team_name}'", is_error=True)
 
-        task = store.get(p.task_id)
+        task = store.get(task_params.task_id)
         if task is None:
-            return ToolResult(output=f"Task '{p.task_id}' not found", is_error=True)
+            return ToolResult(output=f"Task '{task_params.task_id}' not found", is_error=True)
 
         lines = [
             f"Task {task.id}:",

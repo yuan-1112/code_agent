@@ -1,4 +1,4 @@
-
+"""退出计划模式的流程控制工具。"""
 
 from __future__ import annotations
 
@@ -10,10 +10,14 @@ from mewcode.tools.base import Tool, ToolResult
 
 
 class ExitPlanModeParams(BaseModel):
+    """ExitPlanMode 不需要额外输入参数。"""
+
     pass
 
 
 class ExitPlanModeTool(Tool):
+    """在计划模式结束时通知系统切回普通模式。"""
+
     name = "ExitPlanMode"
     description = (
         "Exit plan mode and present the plan for user approval. "
@@ -27,10 +31,12 @@ class ExitPlanModeTool(Tool):
         is_plan_mode: Callable[[], bool] | None = None,
         plan_exists: Callable[[], bool] | None = None,
     ) -> None:
+        """保存对外部计划状态的两个查询函数。"""
         self._is_plan_mode = is_plan_mode
         self._plan_exists = plan_exists
 
     async def execute(self, params: ExitPlanModeParams) -> ToolResult:
+        """检查计划状态是否完整，再返回退出提示。"""
         if self._is_plan_mode is not None and not self._is_plan_mode():
             return ToolResult(
                 output="You are not in plan mode. This tool is only for exiting plan mode after writing a plan.",
@@ -45,6 +51,6 @@ class ExitPlanModeTool(Tool):
             output=(
                 "Plan mode will be exited after this turn. "
                 "The user will be shown the plan approval dialog. "
-                "Do not call any more tools — end your turn now."
+                "Do not call any more tools - end your turn now."
             )
         )

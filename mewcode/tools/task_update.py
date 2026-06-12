@@ -1,4 +1,4 @@
-
+"""团队共享任务更新工具。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 class TaskUpdateParams(BaseModel):
+    """TaskUpdate 的输入参数。"""
+
     task_id: str
     status: str | None = None
     assignee: str | None = None
@@ -25,6 +27,8 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "blocked"}
 
 
 class TaskUpdateTool(Tool):
+    """更新共享任务的状态、负责人、描述或依赖关系。"""
+
     name = "TaskUpdate"
     description = (
         "Update a shared task's status, assignee, description, or dependencies. "
@@ -34,18 +38,18 @@ class TaskUpdateTool(Tool):
     category = "command"
     is_concurrency_safe = True
 
-
     def __init__(self, team_manager: TeamManager, team_name: str) -> None:
+        """保存团队上下文。"""
         self._team_manager = team_manager
         self._team_name = team_name
 
-
     async def execute(self, params: BaseModel) -> ToolResult:
-        p: TaskUpdateParams = params  # type: ignore[assignment]
+        """对指定任务应用一组局部更新。"""
+        task_params: TaskUpdateParams = params  # type: ignore[assignment]
 
-        if p.status and p.status not in VALID_STATUSES:
+        if task_params.status and task_params.status not in VALID_STATUSES:
             return ToolResult(
-                output=f"Invalid status '{p.status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}",
+                output=f"Invalid status '{task_params.status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}",
                 is_error=True,
             )
 
@@ -54,28 +58,28 @@ class TaskUpdateTool(Tool):
             return ToolResult(output=f"Task store not found for team '{self._team_name}'", is_error=True)
 
         task = store.update(
-            task_id=p.task_id,
-            status=p.status,
-            assignee=p.assignee,
-            description=p.description,
-            add_blocks=p.add_blocks,
-            add_blocked_by=p.add_blocked_by,
+            task_id=task_params.task_id,
+            status=task_params.status,
+            assignee=task_params.assignee,
+            description=task_params.description,
+            add_blocks=task_params.add_blocks,
+            add_blocked_by=task_params.add_blocked_by,
         )
 
         if task is None:
-            return ToolResult(output=f"Task '{p.task_id}' not found", is_error=True)
+            return ToolResult(output=f"Task '{task_params.task_id}' not found", is_error=True)
 
         changes: list[str] = []
-        if p.status:
-            changes.append(f"status → {p.status}")
-        if p.assignee is not None:
-            changes.append(f"assignee → {p.assignee or '(unassigned)'}")
-        if p.description is not None:
+        if task_params.status:
+            changes.append(f"status -> {task_params.status}")
+        if task_params.assignee is not None:
+            changes.append(f"assignee -> {task_params.assignee or '(unassigned)'}")
+        if task_params.description is not None:
             changes.append("description updated")
-        if p.add_blocks:
-            changes.append(f"blocks += {', '.join(p.add_blocks)}")
-        if p.add_blocked_by:
-            changes.append(f"blocked_by += {', '.join(p.add_blocked_by)}")
+        if task_params.add_blocks:
+            changes.append(f"blocks += {', '.join(task_params.add_blocks)}")
+        if task_params.add_blocked_by:
+            changes.append(f"blocked_by += {', '.join(task_params.add_blocked_by)}")
 
         return ToolResult(
             output=f"Task {task.id} updated: {'; '.join(changes) if changes else 'no changes'}"

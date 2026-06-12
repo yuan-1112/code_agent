@@ -10,24 +10,36 @@ from datetime import datetime
 
 @dataclass
 class PromptSection:
+    """表示系统提示词（System Prompt）中的一个逻辑分段。"""
+    # 分段名称，用于标识不同模块
     name: str
+    # 优先级，数字越小越靠前，用于组装时进行排序
     priority: int
+    # 具体的提示词文本内容
     content: str
 
 
 class PromptBuilder:
+    """系统提示词构建器，通过收集各分段并按优先级组装成最终的完整提示词。"""
+    
     def __init__(self) -> None:
+        # 用于存储各个提示词分段的内部列表
         self._sections: list[PromptSection] = []
 
 
     def add(self, section: PromptSection) -> PromptBuilder:
+        """向构建器中添加一个新的提示词分段，支持链式调用。"""
         self._sections.append(section)
         return self
 
 
     def build(self) -> str:
+        """根据优先级对分段进行排序，并拼接成完整的提示词字符串。"""
+        # 按 priority 升序排列，决定提示词拼装的前后顺序
         self._sections.sort(key=lambda s: s.priority)
+        # 过滤掉空内容的分段，并截去首尾空白
         parts = [s.content.strip() for s in self._sections if s.content.strip()]
+        # 各个分段之间使用两个换行符分隔
         return "\n\n".join(parts)
 
 
@@ -149,6 +161,7 @@ In code: default to writing no comments. Never write multi-paragraph docstrings 
 
 
 def environment_section(work_dir: str) -> PromptSection:
+    """动态生成包含当前环境信息（工作目录、系统平台、日期）的提示词分段。"""
     lines = [
         "# Environment",
         f" - Working directory: {work_dir}",
@@ -207,6 +220,11 @@ _REMINDER_INTERVAL = 5
 def build_plan_mode_reminder(
     plan_path: str, plan_exists: bool, iteration: int
 ) -> str:
+    """构建计划模式（Plan Mode）下的定期提醒文本。
+    
+    在第一轮或者每隔固定轮次时，输出全量包含五个阶段规范的长提醒；
+    在其他轮次则输出一个简短版本的提醒，以节省上下文。
+    """
     if plan_exists:
         plan_file_info = (
             f"Plan file: {plan_path}\n"
@@ -220,13 +238,16 @@ def build_plan_mode_reminder(
             "using the WriteFile tool."
         )
 
+    # 第一次迭代时，强制输出完整提醒
     if iteration == 1:
         return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
 
+    # 根据间隔控制是否输出长提醒
     attachment_index = (iteration - 1) // _REMINDER_INTERVAL
     if attachment_index % _REMINDER_INTERVAL == 0:
         return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
 
+    # 默认输出简短提醒
     return _PLAN_MODE_SPARSE_REMINDER.format(plan_path=plan_path)
 
 
@@ -243,10 +264,17 @@ def build_system_prompt(
     memory_section: str = "",
     work_dir: str = ".",
 ) -> str:
+    """组装提供给大模型的 System Prompt。
+    
+    将身份认知、系统规则、任务指导等各种静态预设，随着项目指引、记忆项、Skill 配置
+    等动态元素一块打包合成为给 LLM 的终级指示文本。
+    """
+    # 如果当前 Agent 的身份是团队的“总管”（Coordinator），则采用专用的 coordinator 提示词
     if coordinator_mode:
         from mewcode.teams.coordinator import get_coordinator_system_prompt
         return get_coordinator_system_prompt(agent_catalog=agent_catalog)
 
+    # 普通 Agent 走默认组装构建逻辑
     b = PromptBuilder()
     b.add(IDENTITY_SECTION)
     b.add(SYSTEM_SECTION)
@@ -257,6 +285,7 @@ def build_system_prompt(
     b.add(TEXT_OUTPUT_SECTION)
     b.add(environment_section(work_dir))
 
+    # 追加当前工作空间的自定义提示规则
     if custom_instructions:
         b.add(PromptSection(
             name="CustomInstructions",
@@ -264,14 +293,17 @@ def build_system_prompt(
             content=f"# Project Instructions\n\n{custom_instructions}",
         ))
 
+    # 追加激活的专属子技能信息
     if skill_section:
         b.add(PromptSection(name="Skills", priority=90, content=skill_section))
 
+    # 追加长效保存的项目记忆
     if memory_section:
         b.add(PromptSection(name="Memory", priority=95, content=memory_section))
 
     result = b.build()
 
+    # 如果系统拦截层预埋了特殊通知（如第三方事件注入），统一接在 Prompt 尾部
     if hook_prompts:
         result += "\n\n# Hook Injected Context\n" + "\n".join(hook_prompts)
 
@@ -284,20 +316,24 @@ def build_environment_context(
     skill_catalog: str = "",
     agent_catalog: str = "",
 ) -> str:
+    """将物理环境和动态业务状态封装为单条用户级上下文透传给对话。"""
     parts = [
         f"Current working directory: {work_dir}",
         f"Operating system: {platform.system()} {platform.release()}",
         f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
 
+    # 透传多智能体目录
     if agent_catalog:
         parts.append("")
         parts.append(agent_catalog)
 
+    # 透传可选技能清单
     if skill_catalog:
         parts.append("")
         parts.append(skill_catalog)
 
+    # 透传各个具体已经被启用的专有技能正文内容
     if active_skills:
         parts.append("")
         parts.append("## Active Skills")

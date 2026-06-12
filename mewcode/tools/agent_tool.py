@@ -1,3 +1,14 @@
+"""子 agent 启动工具。
+
+这个文件是 tools 目录里最偏“编排层”的一个工具实现。
+它负责把一次 Agent 工具调用分发到几种不同路径：
+1. 普通子 agent，同步或后台运行。
+2. worktree 隔离子 agent。
+3. 团队队友型 agent。
+
+因此阅读这份文件时，建议始终带着一个问题：
+“当前这段代码是在决定走哪条分支，还是在真正启动某种子 agent？”
+"""
 
 from __future__ import annotations
 
@@ -11,6 +22,7 @@ from mewcode.tools.base import Tool, ToolResult
 if TYPE_CHECKING:
     from mewcode.agent import Agent
     from mewcode.agents.loader import AgentLoader
+    from mewcode.agents.parser import AgentDef
     from mewcode.agents.task_manager import TaskManager
     from mewcode.agents.trace import TraceManager
     from mewcode.client import LLMClient
@@ -19,6 +31,8 @@ log = logging.getLogger(__name__)
 
 
 class AgentToolParams(BaseModel):
+    """Agent 工具的输入参数。"""
+
     prompt: str
     description: str
     subagent_type: str | None = None
@@ -38,6 +52,7 @@ class AgentToolParams(BaseModel):
     )
 
 
+# 配置文件里的 permission_mode 是字符串，这里把它映射到内部枚举名。
 PERMISSION_MODE_MAP = {
     "default": "DEFAULT",
     "acceptEdits": "ACCEPT_EDITS",
@@ -45,6 +60,8 @@ PERMISSION_MODE_MAP = {
 }
 
 
+# 队友 agent 与普通子 agent 最大区别在于：它不会把结果直接返回给主用户，
+# 而是要通过 SendMessage 与团队 lead 或其他队友协作。
 TEAMMATE_ADDENDUM = (
     "\n\nIMPORTANT: You are running as an agent in a team.\n"
     "Just writing a response in text is not visible to others\n"
@@ -54,11 +71,13 @@ TEAMMATE_ADDENDUM = (
     "and teammate messaging.\n\n"
     "You are working in an isolated Git worktree. "
     "All file paths you use MUST be relative to your current working directory. "
-    "Do NOT use absolute paths from the original project — they are outside your sandbox and will be rejected."
+    "Do NOT use absolute paths from the original project - they are outside your sandbox and will be rejected."
 )
 
 
 class AgentTool(Tool):
+    """根据参数启动子 agent、队友 agent 或 worktree agent。"""
+
     name = "Agent"
     description = (
         "Launch a sub-agent to handle a task in an isolated context. "
@@ -69,7 +88,6 @@ class AgentTool(Tool):
     params_model = AgentToolParams
     category = "command"
     is_concurrency_safe = False
-
 
     def __init__(
         self,
@@ -82,6 +100,7 @@ class AgentTool(Tool):
         worktree_manager: Any = None,
         team_manager: Any = None,
     ) -> None:
+        """保存启动子 agent 所需的所有外部依赖。"""
         self._agent_loader = agent_loader
         self._task_manager = task_manager
         self._trace_manager = trace_manager
@@ -92,6 +111,13 @@ class AgentTool(Tool):
         self._team_manager = team_manager
 
     async def execute(self, params: BaseModel) -> ToolResult:
+        """根据参数路由到不同的子 agent 启动路径。
+
+        主要分支：
+        - team_name 有值：走队友路径。
+        - isolation=worktree：走 worktree 隔离路径。
+        - 其余情况：走普通子 agent 路径。
+        """
         p: AgentToolParams = params  # type: ignore[assignment]
 
         if p.team_name:
@@ -106,10 +132,10 @@ class AgentTool(Tool):
         if isolation == "worktree":
             return await self._execute_with_worktree(p)
 
+        from mewcode.agent import Agent as AgentClass
         from mewcode.agents.fork import ForkError, build_forked_messages
         from mewcode.agents.parser import AgentDef
         from mewcode.agents.tool_filter import resolve_agent_tools
-        from mewcode.agent import Agent as AgentClass
         from mewcode.conversation import ConversationManager
         from mewcode.permissions import (
             DangerousCommandDetector,
@@ -123,6 +149,8 @@ class AgentTool(Tool):
         conversation: ConversationManager
 
         if p.subagent_type:
+            # 指定了 subagent_type 时，从 agent 模板定义中读取系统提示词、
+            # 最大轮数、权限模式、工具白名单等信息。
             definition = self._agent_loader.get(p.subagent_type)
             if definition is None:
                 return ToolResult(
@@ -132,6 +160,7 @@ class AgentTool(Tool):
                 )
             conversation = ConversationManager()
         else:
+            # 未指定类型时，只有开启 fork 模式才允许基于父对话直接派生子 agent。
             if not self._enable_fork:
                 return ToolResult(
                     output="Fork mode is not enabled. "
@@ -140,15 +169,15 @@ class AgentTool(Tool):
                     is_error=True,
                 )
             try:
-                parent_conv = getattr(self._parent_agent, '_current_conversation', None)
+                parent_conv = getattr(self._parent_agent, "_current_conversation", None)
                 if parent_conv is None:
                     return ToolResult(
                         output="Cannot fork: no active conversation in parent agent.",
                         is_error=True,
                     )
                 conversation = build_forked_messages(parent_conv, p.prompt)
-            except ForkError as e:
-                return ToolResult(output=str(e), is_error=True)
+            except ForkError as exc:
+                return ToolResult(output=str(exc), is_error=True)
 
             definition = AgentDef(
                 agent_type="fork",
@@ -161,21 +190,24 @@ class AgentTool(Tool):
                 source="builtin",
             )
 
-        # 选择 LLM 客户端
+        # 选择子 agent 使用哪个模型客户端：
+        # 可能继承父 agent，也可能使用请求里显式指定的模型。
         client = self._select_llm(p, definition)
 
-        # 判断是否后台运行
+        # background 与 fork 的组合关系比较特殊：
+        # 只要启用了 fork 模式，这里就强制后台运行，避免父子对话互相阻塞。
         is_background = p.run_in_background or definition.background
         if self._enable_fork:
             is_background = True
 
-        # 过滤工具（coordinator 模式可能缩减了注册表，这里用完整注册表）
-        _base_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
+        # coordinator 模式下，父 agent 可能已把 registry 缩成调度视角版本；
+        # 这里优先拿完整 registry，再按子 agent 定义做一次细粒度过滤。
+        base_registry = getattr(self._parent_agent, "_full_registry", None) or self._parent_agent.registry
         filtered_registry = resolve_agent_tools(
-            _base_registry, definition, is_background
+            base_registry, definition, is_background
         )
 
-        # 为子 agent 创建权限检查器
+        # 每个子 agent 都有自己独立的权限检查器，保证不同隔离策略互不影响。
         pm_str = definition.permission_mode
         pm_enum = getattr(
             PermissionMode,
@@ -189,7 +221,7 @@ class AgentTool(Tool):
             mode=pm_enum,
         )
 
-        # 创建子 agent
+        # 真正实例化子 agent。到这一步为止，前面所有逻辑都只是“准备启动条件”。
         sub_agent = AgentClass(
             client=client,
             registry=filtered_registry,
@@ -204,15 +236,16 @@ class AgentTool(Tool):
         sub_agent.parent_id = self._parent_agent.agent_id
         sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id
 
-        # fork 子 agent 继承父 agent 的替换状态，确保共享的 tool_use_id 做出一致的
-        # 决策——这样父子共享的 prompt cache 前缀才能保持字节级一致
         if p.subagent_type is None:
+            # fork 模式会复制父 agent 的 replacement_state，
+            # 以便父子共用 prompt cache 时仍能保持 tool_result 替换逻辑一致。
             from mewcode.context import clone_replacement_state
+
             sub_agent.replacement_state = clone_replacement_state(
                 self._parent_agent.replacement_state
             )
 
-        # 注册追踪节点
+        # trace 节点是子 agent 生命周期记录的入口，后续完成/失败都会回写到这里。
         trace_node = self._trace_manager.create(
             agent_type=definition.agent_type,
             parent_id=self._parent_agent.agent_id,
@@ -224,6 +257,7 @@ class AgentTool(Tool):
         is_fork = p.subagent_type is None
 
         if is_background:
+            # 后台模式下，不等待子 agent 结果，而是交给 TaskManager 持续运行。
             if is_fork:
                 sub_agent._fork_conversation = conversation
             task_id = self._task_manager.launch(
@@ -241,16 +275,16 @@ class AgentTool(Tool):
                 f"Do NOT wait, sleep, or poll. Report the task ID to the user and move on.",
             )
 
-        # 前台同步执行
         try:
+            # 前台模式下，同步等待子 agent 跑到结束。
             if is_fork:
                 result_text = await sub_agent.run_to_completion("", conversation)
             else:
                 result_text = await sub_agent.run_to_completion(p.prompt)
-        except Exception as e:
+        except Exception as exc:
             self._trace_manager.complete(trace_node.agent_id, "failed")
             return ToolResult(
-                output=f"Sub-agent failed: {e}", is_error=True
+                output=f"Sub-agent failed: {exc}", is_error=True
             )
 
         self._trace_manager.update(
@@ -263,15 +297,22 @@ class AgentTool(Tool):
         return ToolResult(output=result_text or "(sub-agent returned no output)")
 
     async def _execute_as_teammate(self, p: AgentToolParams) -> ToolResult:
+        """以“团队队友”的方式启动子 agent。
+
+        这条链路和普通子 agent 的不同点在于：
+        - 会创建独立 worktree。
+        - 会构建专门的 teammate 工具集。
+        - 结果不会直接返回给主用户，而是通过团队机制协作。
+        """
         if self._team_manager is None:
             return ToolResult(output="TeamManager not configured.", is_error=True)
         if self._worktree_manager is None:
             return ToolResult(output="WorktreeManager not configured for team spawn.", is_error=True)
 
+        from mewcode.agent import Agent as AgentClass
         from mewcode.agents.fork import ForkError, build_forked_messages
         from mewcode.agents.parser import AgentDef
         from mewcode.agents.tool_filter import build_teammate_tools
-        from mewcode.agent import Agent as AgentClass
         from mewcode.conversation import ConversationManager
         from mewcode.permissions import (
             DangerousCommandDetector,
@@ -287,8 +328,9 @@ class AgentTool(Tool):
         if team is None:
             return ToolResult(output=f"Team '{p.team_name}' not found. Create it first with TeamCreate.", is_error=True)
 
+        # 队友名需要在团队内唯一；若重名则自动追加计数后缀。
         base_name = p.name or p.subagent_type or "worker"
-        existing_names = {m.name for m in team.members}
+        existing_names = {member.name for member in team.members}
         teammate_name = base_name
         if teammate_name in existing_names:
             counter = 2
@@ -296,7 +338,6 @@ class AgentTool(Tool):
                 counter += 1
             teammate_name = f"{base_name}-{counter}"
 
-        # 1. 加载 agent 定义
         definition: AgentDef
         conversation: ConversationManager | None = None
         is_fork = False
@@ -311,15 +352,16 @@ class AgentTool(Tool):
                 )
             definition = defn
         else:
+            # 队友也允许 fork 父对话，但只有 enable_fork 打开时才生效。
             if self._enable_fork:
                 try:
-                    parent_conv = getattr(self._parent_agent, '_current_conversation', None)
+                    parent_conv = getattr(self._parent_agent, "_current_conversation", None)
                     if parent_conv is None:
                         return ToolResult(output="Cannot fork: no active conversation.", is_error=True)
                     conversation = build_forked_messages(parent_conv, p.prompt)
                     is_fork = True
-                except ForkError as e:
-                    return ToolResult(output=str(e), is_error=True)
+                except ForkError as exc:
+                    return ToolResult(output=str(exc), is_error=True)
 
             definition = AgentDef(
                 agent_type="teammate",
@@ -332,20 +374,18 @@ class AgentTool(Tool):
                 source="builtin",
             )
 
-        # 2. 创建 worktree
+        # 每个队友都分配独立 worktree，避免相互写同一工作目录。
         wt_name = f"team-{p.team_name}/{teammate_name}"
         try:
             wt = await self._worktree_manager.create(wt_name, "HEAD")
-        except Exception as e:
-            return ToolResult(output=f"Failed to create worktree for teammate: {e}", is_error=True)
+        except Exception as exc:
+            return ToolResult(output=f"Failed to create worktree for teammate: {exc}", is_error=True)
 
-        # 3. 选择 LLM
         client = self._select_llm(p, definition)
 
-        # 4. 检测后端类型
+        # 团队后端可能是 tmux、iTerm2 或进程内执行，不同后端会决定后续启动方式。
         backend = self._team_manager.detect_backend()
 
-        # 5. 构建队友的工具集
         trace_node = self._trace_manager.create(
             agent_type=definition.agent_type,
             parent_id=self._parent_agent.agent_id,
@@ -353,15 +393,15 @@ class AgentTool(Tool):
         )
         agent_id = trace_node.agent_id
 
-        _has_full = getattr(self._parent_agent, '_full_registry', None) is not None
-        full_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
-        _full_tools = [t.name for t in full_registry.list_tools()]
+        full_registry = getattr(self._parent_agent, "_full_registry", None) or self._parent_agent.registry
+        full_tools = [tool.name for tool in full_registry.list_tools()]
         log.info(
-            "[teammate] has_full_registry=%s full_tools=%d names=%s backend=%s def_tools=%s def_disallowed=%s",
-            _has_full, len(_full_tools), _full_tools,
+            "[teammate] full_tools=%d names=%s backend=%s def_tools=%s def_disallowed=%s",
+            len(full_tools),
+            full_tools,
             backend.value,
-            getattr(definition, 'tools', []),
-            getattr(definition, 'disallowed_tools', []),
+            getattr(definition, "tools", []),
+            getattr(definition, "disallowed_tools", []),
         )
         teammate_registry = build_teammate_tools(
             parent_registry=full_registry,
@@ -372,10 +412,10 @@ class AgentTool(Tool):
             backend_type=backend.value,
             definition=definition,
         )
-        _tm_tools = [t.name for t in teammate_registry.list_tools()]
-        log.info("[teammate] result_tools=%d names=%s", len(_tm_tools), _tm_tools)
+        teammate_tools = [tool.name for tool in teammate_registry.list_tools()]
+        log.info("[teammate] result_tools=%d names=%s", len(teammate_tools), teammate_tools)
 
-        # 6. 创建子 agent 并附加队友专属指令
+        # 队友说明会在原始 system_prompt 后追加，强制提醒其通过消息系统协作。
         instructions = (definition.system_prompt or "") + TEAMMATE_ADDENDUM
 
         checker = PermissionChecker(
@@ -402,7 +442,7 @@ class AgentTool(Tool):
         sub_agent.team_name = p.team_name
         sub_agent._team_manager = self._team_manager
 
-        # 7. 注册名称和成员信息
+        # 注册名称和成员信息后，团队其他组件才能通过名字解析到该队友。
         AgentNameRegistry.instance().register(teammate_name, agent_id)
 
         member = TeammateInfo(
@@ -416,13 +456,12 @@ class AgentTool(Tool):
         )
         self._team_manager.register_member(p.team_name, member)
 
-        # 8. 按后端类型启动队友
         if backend in (BackendType.TMUX, BackendType.ITERM2):
             return self._spawn_pane_teammate(
-                p, team, member, backend, wt, agent_id, teammate_name
+                p, member, backend, wt, agent_id, teammate_name
             )
 
-        # 进程内模式：直接用 task_manager 执行并通知结果
+        # 进程内后端直接交给 TaskManager 运行，由系统后续通知完成结果。
         task_id = self._task_manager.launch(
             agent=sub_agent,
             task="" if is_fork else p.prompt,
@@ -441,11 +480,16 @@ class AgentTool(Tool):
             )
         )
 
-
     def _spawn_pane_teammate(
-        self, p: Any, team: Any, member: Any, backend: Any, wt: Any,
-        agent_id: str, teammate_name: str,
+        self,
+        p: Any,
+        member: Any,
+        backend: Any,
+        wt: Any,
+        agent_id: str,
+        teammate_name: str,
     ) -> ToolResult:
+        """使用 tmux 或 iTerm2 面板启动独立队友进程。"""
         from mewcode.teams.models import BackendType
 
         mailbox = self._team_manager.get_mailbox(p.team_name)
@@ -454,6 +498,7 @@ class AgentTool(Tool):
         try:
             if backend == BackendType.TMUX:
                 from mewcode.teams.spawn_tmux import spawn_tmux_teammate
+
                 pane_info = spawn_tmux_teammate(
                     team_name=p.team_name,
                     teammate_name=teammate_name,
@@ -466,6 +511,7 @@ class AgentTool(Tool):
                 self._team_manager.register_pane_id(agent_id, pane_info.pane_id)
             elif backend == BackendType.ITERM2:
                 from mewcode.teams.spawn_iterm2 import spawn_iterm2_teammate
+
                 pane_info = spawn_iterm2_teammate(
                     team_name=p.team_name,
                     teammate_name=teammate_name,
@@ -475,10 +521,10 @@ class AgentTool(Tool):
                     model=p.model or "",
                     mailbox_dir=mailbox_dir,
                 )
-        except Exception as e:
-            log.warning("Pane spawn failed, falling back to in-process: %s", e)
+        except Exception as exc:
+            log.warning("Pane spawn failed, falling back to in-process: %s", exc)
             return ToolResult(
-                output=f"Pane spawn failed ({e}), teammate not started. Retry or set teammate_mode to in-process.",
+                output=f"Pane spawn failed ({exc}), teammate not started. Retry or set teammate_mode to in-process.",
                 is_error=True,
             )
 
@@ -492,14 +538,18 @@ class AgentTool(Tool):
             )
         )
 
-
     def _select_llm(
         self,
         params: AgentToolParams,
         definition: AgentDef,
     ) -> LLMClient:
-        from mewcode.agents.parser import AgentDef
+        """决定子 agent 使用哪个 LLMClient。
 
+        优先级：
+        1. 请求参数里显式指定 model。
+        2. agent 定义里声明的 model（且不为 inherit）。
+        3. 继承父 agent 当前的 client。
+        """
         model_override = params.model or (
             definition.model if definition.model != "inherit" else None
         )
@@ -511,18 +561,17 @@ class AgentTool(Tool):
 
         return self._parent_agent.client
 
-
     async def _execute_with_worktree(self, p: AgentToolParams) -> ToolResult:
+        """以独立 worktree 的方式运行子 agent。"""
         if self._worktree_manager is None:
             return ToolResult(
                 output="Worktree isolation is not available: WorktreeManager not configured.",
                 is_error=True,
             )
 
+        from mewcode.agent import Agent as AgentClass
         from mewcode.agents.parser import AgentDef
         from mewcode.agents.tool_filter import resolve_agent_tools
-        from mewcode.agent import Agent as AgentClass
-        from mewcode.conversation import ConversationManager
         from mewcode.permissions import (
             DangerousCommandDetector,
             PathSandbox,
@@ -559,20 +608,21 @@ class AgentTool(Tool):
         wt_name = generate_worktree_name()
         try:
             wt = await self._worktree_manager.create(wt_name, "HEAD")
-        except Exception as e:
+        except Exception as exc:
             return ToolResult(
-                output=f"Failed to create worktree: {e}",
+                output=f"Failed to create worktree: {exc}",
                 is_error=True,
             )
 
+        # 在真正用户任务前拼接一段说明，告诉子 agent 原目录与 worktree 的关系。
         notice = build_worktree_notice(self._parent_agent.work_dir, wt.path)
         task = notice + "\n\n" + p.prompt
 
         client = self._select_llm(p, definition)
 
-        _base_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
+        base_registry = getattr(self._parent_agent, "_full_registry", None) or self._parent_agent.registry
         filtered_registry = resolve_agent_tools(
-            _base_registry, definition, False
+            base_registry, definition, False
         )
 
         pm_str = definition.permission_mode
@@ -611,10 +661,10 @@ class AgentTool(Tool):
 
         try:
             result_text = await sub_agent.run_to_completion(task)
-        except Exception as e:
+        except Exception as exc:
             self._trace_manager.complete(trace_node.agent_id, "failed")
             return ToolResult(
-                output=f"Sub-agent in worktree failed: {e}",
+                output=f"Sub-agent in worktree failed: {exc}",
                 is_error=True,
             )
 
@@ -633,8 +683,11 @@ class AgentTool(Tool):
 
         return ToolResult(output=result_text or "(sub-agent returned no output)")
 
-
     def _create_client_for_model(self, model_alias: str) -> LLMClient | None:
+        """按模型别名创建新的客户端实例。
+
+        这里的目的不是修改父 agent 的 client，而是给子 agent 单独换一个模型。
+        """
         if self._provider_config is None:
             return None
 
@@ -659,4 +712,5 @@ class AgentTool(Tool):
         try:
             return create_client(config)
         except Exception:
+            # 如果新模型客户端创建失败，就回退到父 agent 当前客户端。
             return None

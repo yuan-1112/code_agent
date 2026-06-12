@@ -1,4 +1,4 @@
-
+"""进入隔离 worktree 的工具。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class EnterWorktreeParams(BaseModel):
+    """EnterWorktree 的输入参数。"""
+
     name: Optional[str] = Field(
         default=None,
         description=(
@@ -26,6 +28,8 @@ class EnterWorktreeParams(BaseModel):
 
 
 class EnterWorktreeTool(Tool):
+    """创建新的 git worktree，并把当前会话切进去。"""
+
     name = "EnterWorktree"
     description = (
         "Creates an isolated worktree (via git) and switches the session into it"
@@ -34,12 +38,12 @@ class EnterWorktreeTool(Tool):
     category = "command"
     should_defer = True
 
-
     def __init__(self, worktree_manager: WorktreeManager) -> None:
+        """保存 worktree 管理器引用。"""
         self._manager = worktree_manager
 
-
     async def execute(self, params: EnterWorktreeParams) -> ToolResult:
+        """创建并进入一个新的隔离 worktree 会话。"""
         if self._manager.get_current_session() is not None:
             return ToolResult(
                 output="Already in a worktree session", is_error=True
@@ -54,9 +58,9 @@ class EnterWorktreeTool(Tool):
         try:
             wt = await self._manager.create(slug)
             session = await self._manager.enter(slug)
-        except Exception as e:
+        except Exception as exc:
             return ToolResult(
-                output=f"Error creating worktree: {e}", is_error=True
+                output=f"Error creating worktree: {exc}", is_error=True
             )
 
         branch_info = f" on branch {wt.branch}" if wt.branch else ""

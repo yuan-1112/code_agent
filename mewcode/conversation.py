@@ -39,7 +39,7 @@ class Message:
 # 与 context.manager 中的恢复状态启发值保持一致，全代码库统一使用同一比率。
 _CHARS_PER_TOKEN = 3.5
 
-
+# 统计消息字符数
 def _message_chars(m: Message) -> int:
     n = len(m.content)
     for tb in m.thinking_blocks:
@@ -151,6 +151,7 @@ class ConversationManager:
     def inject_long_term_memory(
         self, instructions: str, memories: str
     ) -> None:
+        # 一次性注入长期记忆和指令，并且放在环境信息之后。注入后设置 ltm_injected 标志，避免重复注入。
         if self.ltm_injected:
             return
         sections: list[str] = []
@@ -183,6 +184,8 @@ class ConversationManager:
         self.ltm_injected = True
 
     def replace_history(self, new_messages: list[Message]) -> None:
+        # 直接替换整个历史，通常用于基于摘要结果重置历史。重置后清除用量锚点，
+        # 让 current_tokens() 退化为字符估算，直到下次 API 响应基于新历史重新建立锚点。
         self.history = new_messages
         self.env_injected = False
         self.ltm_injected = False
