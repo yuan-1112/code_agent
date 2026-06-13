@@ -18,6 +18,24 @@ from mewcode.conversation import (
 )
 from mewcode.serialization import build_messages
 
+"""上下文管理模块。
+
+这个文件负责控制 Agent 对话历史的体积，避免上下文无限增长后把模型窗口撑满。
+
+整体分成三大块：
+1. Layer 1：工具结果预算控制。
+   先在本地处理大工具结果，包括落盘、替换预览、裁剪过旧结果。
+2. Layer 2：整段会话摘要压缩。
+   当前缀历史累计过大时，调用 LLM 把早期对话压成一段结构化摘要。
+3. Post-compact recovery：压缩后恢复块。
+   摘要会让模型失去很多近期细节，所以这里会把最近读过的文件、最近触发的技能、
+   当前可用工具，再重新附加到摘要消息后面，降低“压完就失忆”的概率。
+
+阅读这份代码时，建议顺着这条主线看：
+`apply_tool_result_budget()` -> `auto_compact()` -> `build_recovery_attachment()`。
+前面的大量辅助函数，基本都是围绕这三步服务的。
+"""
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -96,10 +114,34 @@ class ContentReplacementRecord:
 
 
 def create_replacement_state() -> ContentReplacementState:
+    """创建一份空的内容替换状态。
+
+    输入:
+        无。
+
+    输出:
+        返回新的 `ContentReplacementState`。
+
+    说明:
+        Layer 1 不直接原地篡改会话历史，而是通过这份状态记录：
+        哪些 `tool_use_id` 已经见过，哪些结果已经被替换成了 preview。
+        这样预算控制逻辑会更稳定，也更方便恢复。
+    """
     return ContentReplacementState()
 
 
 def clone_replacement_state(src: ContentReplacementState) -> ContentReplacementState:
+    """复制内容替换状态。
+
+    输入:
+        src: 原始替换状态。
+
+    输出:
+        返回一份可独立修改的新状态对象。
+
+    说明:
+        这里显式复制集合和字典，避免后续修改时和旧状态共享底层容器。
+    """
     return ContentReplacementState(
         seen_ids=set(src.seen_ids),
         replacements=dict(src.replacements),
@@ -112,6 +154,18 @@ REPLACEMENT_RECORDS_FILENAME = "replacement_records.jsonl"
 def append_replacement_records(
     session_dir: Path, records: list[ContentReplacementRecord]
 ) -> None:
+    """把本轮新增的替换记录追加写入磁盘。
+
+    输入:
+        session_dir: 当前会话目录。
+        records: 本轮新增的替换记录列表。
+
+    输出:
+        无返回值。
+
+    说明:
+        使用 JSONL 追加写，而不是每次重写整个文件，适合按轮次持续积累替换决策。
+    """
     if not records:
         return
     path = session_dir / REPLACEMENT_RECORDS_FILENAME
@@ -125,6 +179,14 @@ def append_replacement_records(
 
 
 def load_replacement_records(session_dir: Path) -> list[ContentReplacementRecord]:
+    """从 session 目录读取历史替换记录。
+
+    输入:
+        session_dir: 当前会话目录。
+
+    输出:
+        返回历史 `ContentReplacementRecord` 列表。
+    """
     path = session_dir / REPLACEMENT_RECORDS_FILENAME
     if not path.exists():
         return []
@@ -148,6 +210,20 @@ def reconstruct_replacement_state(
     records: list[ContentReplacementRecord],
     inherited_replacements: Mapping[str, str] | None = None,
 ) -> ContentReplacementState:
+    """根据历史消息和持久化记录重建替换状态。
+
+    输入:
+        messages: 当前恢复后的消息历史。
+        records: 从磁盘读取到的历史替换记录。
+        inherited_replacements: 可选的上层补充替换映射。
+
+    输出:
+        返回重建后的 `ContentReplacementState`。
+
+    说明:
+        只有当前历史中仍然存在的 `tool_use_id` 才应该进入状态，
+        已经脱离当前历史的旧记录不应继续污染新的上下文。
+    """
     state = create_replacement_state()
     candidate_ids: set[str] = set()
     for msg in messages:
@@ -169,12 +245,34 @@ def reconstruct_replacement_state(
 # ---------------------------------------------------------------------------
 
 def ensure_session_dir(work_dir: str) -> Path:
+    """确保工具结果落盘目录存在。
+
+    输入:
+        work_dir: 当前工作目录。
+
+    输出:
+        返回 session 目录路径。
+
+    说明:
+        Layer 1 的大结果落盘和 Layer 2 的清理步骤都会用到这里返回的目录。
+    """
     session_dir = Path(work_dir) / SESSION_SUBDIR
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
 
 
 def cleanup_tool_results(session_dir: Path) -> None:
+    """清空工具结果落盘目录，并重建为空目录。
+
+    输入:
+        session_dir: 当前会话目录。
+
+    输出:
+        无返回值。
+
+    说明:
+        Layer 2 压缩完成后，旧的大结果文件引用通常已经失效，直接整目录清理最简单。
+    """
     if session_dir.exists():
         shutil.rmtree(session_dir)
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +283,20 @@ def cleanup_tool_results(session_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def persist_tool_result(tool_use_id: str, content: str, session_dir: Path) -> Path:
+    """把超大工具结果写入磁盘。
+
+    输入:
+        tool_use_id: 工具调用唯一标识。
+        content: 工具输出全文。
+        session_dir: 当前会话目录。
+
+    输出:
+        返回写入目标路径。
+
+    说明:
+        使用 `os.O_EXCL` 确保文件已存在时创建失败，从而让这一步具备幂等性。
+        对同一个 `tool_use_id`，第一次写成功后，后续重复调用只会复用原文件。
+    """
     file_path = session_dir / f"{tool_use_id}.txt"
     try:
         fd = os.open(str(file_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -196,6 +308,19 @@ def persist_tool_result(tool_use_id: str, content: str, session_dir: Path) -> Pa
 
 
 def make_persisted_preview(content: str, file_path: Path) -> str:
+    """为已落盘的大结果构造一段可放回上下文的预览文本。
+
+    输入:
+        content: 工具输出全文。
+        file_path: 完整内容落盘后的文件路径。
+
+    输出:
+        返回带 `PERSISTED_TAG` 的预览字符串。
+
+    说明:
+        这段预览既告诉模型“全文已移出上下文”，也保留少量开头片段，
+        让模型能快速判断是否值得再用 `ReadFile` 回读原文。
+    """
     size_kb = len(content.encode("utf-8")) // 1024
     preview = content[:PREVIEW_CHARS]
     return (
@@ -210,6 +335,18 @@ def make_persisted_preview(content: str, file_path: Path) -> str:
 
 
 def _count_turns(messages: list[Message]) -> int:
+    """统计会话轮次数。
+
+    输入:
+        messages: 消息列表。
+
+    输出:
+        返回轮次数。
+
+    说明:
+        这里把“没有工具调用的 assistant 消息”视为一轮结束标记，
+        因为它通常代表这一轮任务处理已经形成自然语言回复。
+    """
     count = 0
     for m in messages:
         if m.role == "assistant" and not m.tool_uses:
@@ -217,9 +354,14 @@ def _count_turns(messages: list[Message]) -> int:
     return count
 
 
+# 这个辅助函数只做一件事：在保留消息其余字段不变的前提下，
+# 用新的 tool_results 重新构造一条 Message。
+# Layer 1 会多次替换工具结果内容，如果直接原地改旧对象，后续恢复状态和调试都会更绕，
+# 所以这里统一走“复制旧消息，换新结果”的方式。
 def _copy_message_with_results(
     msg: Message, new_tool_results: list[ToolResultBlock]
 ) -> Message:
+    """复制消息对象，并仅替换其工具结果列表。"""
     return Message(
         role=msg.role,
         content=msg.content,
@@ -229,9 +371,52 @@ def _copy_message_with_results(
     )
 
 
+# 这是 Layer 1 的第三趟扫描。
+# 前两趟主要解决“当前消息里工具结果太大”，这一趟解决“老历史里的长结果还在持续占空间”。
+# 处理方式更激进：最近若干轮尽量不动，更早轮次里的长结果只保留极短预览，
+# 不再像 persisted preview 那样保留可回读全文。
 def _snip_stale_messages(
     history: list[Message],
 ) -> list[Message]:
+    """裁剪过旧轮次中的长工具结果。
+
+    输入:
+        history: 当前消息历史。
+
+    输出:
+        返回裁剪后的历史列表。
+
+    说明:
+        这是 Layer 1 的 Pass 3。
+        前两步优先解决“当前消息太大”，这一步则解决“很久以前的长结果还在占空间”。
+    """
+    """构造压缩后的摘要入口消息。
+
+    输入:
+        summary: 早期对话摘要。
+        attachment: 压缩后恢复块。
+        has_keep_tail: 是否仍保留了最近原文尾部。
+        transcript_path: 压缩前完整会话转录路径。
+
+    输出:
+        返回新的消息列表，目前包含一条承载摘要的 `user` 消息。
+
+    说明:
+        这条消息是压缩后的新起点，用来告诉模型：
+        早期历史已经浓缩成摘要，近期原文可能还保留，完整细节需要时应重新读取。
+    """
+    """裁剪过旧轮次中的长工具结果。
+
+    输入:
+        history: 当前消息历史。
+
+    输出:
+        返回裁剪后的历史列表。
+
+    说明:
+        这是 Layer 1 的 Pass 3。
+        前两步优先解决“当前消息太大”，这一步则解决“很久以前的长结果还在占空间”。
+    """
     total_turns = _count_turns(history)
     if total_turns <= KEEP_RECENT_TURNS:
         return history
@@ -291,6 +476,9 @@ def apply_tool_result_budget(
 
     state 会被 mutate：本轮新决定的 id 进入 seen_ids，新决定替换的 id 进入 replacements。
     """
+    # 这是 Layer 1 的主入口。
+    # 整体策略是“读旧历史 -> 做替换决策 -> 生成新历史”，
+    # 而不是直接在旧 conversation 上原地改内容。
     new_records: list[ContentReplacementRecord] = []
     new_history: list[Message] = []
 
@@ -304,8 +492,10 @@ def apply_tool_result_budget(
 
         for tr in msg.tool_results:
             if tr.tool_use_id in state.replacements:
+                # 之前已经替换过，直接复用旧决策，保证同一结果在后续轮次里表现一致。
                 decisions[tr.tool_use_id] = state.replacements[tr.tool_use_id]
             elif tr.tool_use_id in state.seen_ids:
+                # 已经见过但没做过替换，说明之前的决策是“原文保留”。
                 decisions[tr.tool_use_id] = tr.content
             elif tr.content.startswith(PERSISTED_TAG):
                 # 已被外部（如某些工具本身）打上 persisted-output 标签 —— 视为已知决策
@@ -322,6 +512,7 @@ def apply_tool_result_budget(
         persisted_p1: set[str] = set()
         for tr in fresh:
             if len(tr.content) > SINGLE_RESULT_CHAR_LIMIT:
+                # Pass 1 先解决极端大的单条结果，避免“一条就炸上下文”。
                 fp = persist_tool_result(tr.tool_use_id, tr.content, session_dir)
                 preview = make_persisted_preview(tr.content, fp)
                 decisions[tr.tool_use_id] = preview
@@ -342,6 +533,7 @@ def apply_tool_result_budget(
             for tr in ranked:
                 if total <= AGGREGATE_CHAR_LIMIT:
                     break
+                # Pass 2 按长度降序替换，优先处理最长结果，回收空间效率最高。
                 fp = persist_tool_result(tr.tool_use_id, tr.content, session_dir)
                 preview = make_persisted_preview(tr.content, fp)
                 old_len = len(tr.content)
@@ -356,6 +548,7 @@ def apply_tool_result_budget(
         # 剩余未替换的 fresh 标记为"已见但未替换"
         for tr in fresh:
             if tr.tool_use_id not in state.replacements:
+                # 没被替换也要记成 seen，避免下一轮又把它当成全新结果重新决策。
                 state.seen_ids.add(tr.tool_use_id)
                 decisions[tr.tool_use_id] = tr.content
 
@@ -389,12 +582,25 @@ def apply_tool_result_budget(
 # ---------------------------------------------------------------------------
 
 def compute_compact_threshold(context_window: int, manual: bool = False) -> int:
+    """计算触发 Layer 2 压缩的 token 阈值。
+
+    输入:
+        context_window: 当前模型的上下文窗口大小。
+        manual: 是否手动触发压缩。
+
+    输出:
+        返回触发压缩的 token 阈值。
+
+    说明:
+        先预留摘要输出空间，再减掉安全边距；自动模式更保守，手动模式更激进。
+    """
     effective = context_window - SUMMARY_OUTPUT_RESERVE
     margin = MANUAL_COMPACT_SAFETY_MARGIN if manual else AUTO_COMPACT_SAFETY_MARGIN
     return effective - margin
 
 
 def should_auto_compact(last_input_tokens: int, context_window: int) -> bool:
+    """快速判断当前是否达到自动压缩阈值。"""
     return last_input_tokens >= compute_compact_threshold(context_window)
 
 
@@ -421,6 +627,15 @@ SUMMARY_PROMPT = """\
 
 
 def extract_summary(llm_output: str) -> str:
+    """从 LLM 输出中提取正式摘要段。
+
+    输入:
+        llm_output: 摘要模型返回的原始文本。
+
+    输出:
+        若存在 `<summary>...</summary>`，返回其中内容；
+        否则返回完整输出作为兜底。
+    """
     start = llm_output.find("<summary>")
     end = llm_output.find("</summary>")
     if start == -1 or end == -1:
@@ -428,12 +643,33 @@ def extract_summary(llm_output: str) -> str:
     return llm_output[start + len("<summary>"):end].strip()
 
 
+# 这里构造的是“压缩后的新会话开头”。
+# 它不会把整段历史重新展开，而是只放：
+# 1. 早期历史的摘要
+# 2. 近期原文是否还保留的提示
+# 3. 完整细节需要时去哪里重新读取
+# 4. 可选的恢复块（最近文件/技能/工具）
 def build_compact_messages(
     summary: str,
     attachment: str = "",
     has_keep_tail: bool = False,
     transcript_path: str = "",
 ) -> list[Message]:
+    """构造压缩后的摘要入口消息。
+
+    输入:
+        summary: 早期对话摘要。
+        attachment: 压缩后恢复块。
+        has_keep_tail: 是否仍保留了最近原文尾部。
+        transcript_path: 压缩前完整会话转录路径。
+
+    输出:
+        返回新的消息列表，目前包含一条承载摘要的 `user` 消息。
+
+    说明:
+        这条消息是压缩后的新起点，用来告诉模型：
+        早期历史已经浓缩成摘要，近期原文可能还保留，完整细节需要时应重新读取。
+    """
     content = "本次会话延续自之前的对话，因上下文空间不足进行了压缩。以下是早期对话的摘要：\n\n" + summary
     if has_keep_tail:
         content += "\n\n近期消息已原样保留。"
@@ -482,11 +718,23 @@ class RecoveryState:
     """
 
     def __init__(self) -> None:
+        """初始化压缩后恢复状态容器。
+
+        输入:
+            无。
+
+        输出:
+            无返回值。
+
+        说明:
+            内部记录最近文件快照和技能快照，并用锁保护，避免并发写入时状态错乱。
+        """
         self._lock = threading.Lock()
         self._files: dict[str, FileReadRecord] = {}
         self._skills: dict[str, SkillInvocationRecord] = {}
 
     def record_file_read(self, path: str, content: str) -> None:
+        """记录一次文件读取快照。"""
         if not path:
             return
         with self._lock:
@@ -495,6 +743,7 @@ class RecoveryState:
             )
 
     def record_skill_invocation(self, name: str, body: str) -> None:
+        """记录一次技能触发快照。"""
         if not name:
             return
         with self._lock:
@@ -503,6 +752,7 @@ class RecoveryState:
             )
 
     def snapshot_files(self, limit: int) -> list[FileReadRecord]:
+        """按最近时间倒序导出文件快照。"""
         with self._lock:
             records = list(self._files.values())
         records.sort(key=lambda r: r.timestamp, reverse=True)
@@ -511,6 +761,7 @@ class RecoveryState:
         return records
 
     def snapshot_skills(self) -> list[SkillInvocationRecord]:
+        """按最近时间倒序导出技能快照。"""
         with self._lock:
             records = list(self._skills.values())
         records.sort(key=lambda r: r.timestamp, reverse=True)
@@ -518,12 +769,14 @@ class RecoveryState:
 
 
 def _approx_tokens(s: str) -> int:
+    """用固定字符/token 比例做近似 token 估算。"""
     if not s:
         return 0
     return int(len(s) / _RECOVERY_CHARS_PER_TOKEN)
 
 
 def _truncate_by_tokens(s: str, token_budget: int) -> str:
+    """按近似 token 预算截断文本，并追加截断提示。"""
     if token_budget <= 0 or not s:
         return s
     if _approx_tokens(s) <= token_budget:
@@ -535,6 +788,7 @@ def _truncate_by_tokens(s: str, token_budget: int) -> str:
 
 
 def _first_line(s: str) -> str:
+    """提取首个非空行。"""
     for line in s.split("\n"):
         stripped = line.strip()
         if stripped:
@@ -552,6 +806,7 @@ def build_recovery_attachment(
     `tool_schemas` 应当是 agent 在下一次请求中将要发送的 schema —— 这里用其中的
     名称和描述来提醒模型当前都接入了哪些工具。
     """
+    # 这里生成的不是给人类看的长文档，而是给压缩后的模型做“工作记忆回填”的紧凑块。
     sections: list[str] = []
 
     if state is not None:
@@ -560,6 +815,7 @@ def build_recovery_attachment(
             buf = ["## 最近读过的文件\n",
                    "以下快照是文件读取工具上次返回的内容。如需当前字节请重新读取。\n"]
             for rec in files:
+                # 每个文件快照都要受预算限制，避免恢复块反过来把新上下文再撑满。
                 content = _truncate_by_tokens(rec.content, RECOVERY_TOKENS_PER_FILE)
                 ts = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(rec.timestamp)
@@ -579,6 +835,7 @@ def build_recovery_attachment(
             used = 0
             emitted = False
             for sk in skills:
+                # 技能正文可能很长，因此一边累计预算一边决定是否继续输出。
                 body = _truncate_by_tokens(sk.body, RECOVERY_TOKENS_PER_SKILL)
                 tokens = _approx_tokens(body) + _approx_tokens(sk.name) + 8
                 if used + tokens > RECOVERY_SKILLS_BUDGET:
@@ -593,6 +850,7 @@ def build_recovery_attachment(
         buf = ["## 可用工具\n",
                "你仍然可以调用以下工具，需要时直接发起调用即可：\n"]
         for t in tool_schemas:
+            # 工具列表只保留名字和描述首行，目的是提醒“还能调用什么”，而不是再次展开完整 schema。
             name = t.get("name") if isinstance(t, Mapping) else None
             if not name:
                 continue
@@ -615,6 +873,18 @@ def build_recovery_attachment(
 
 
 def _group_messages_by_turn(messages: list[Message]) -> list[list[Message]]:
+    """按“对话轮次”对消息分组。
+
+    输入:
+        messages: 待分组消息列表。
+
+    输出:
+        返回二维列表，每个子列表代表一轮对话。
+
+    说明:
+        摘要失败后做降级重试时，会按轮次整体丢掉最老的一部分历史，
+        这样比随便砍几条消息更不容易把一轮工作拆散。
+    """
     groups: list[list[Message]] = []
     current: list[Message] = []
     for msg in messages:
@@ -645,6 +915,8 @@ def _compute_keep_start_index(messages: list[Message]) -> int:
     下标往前挪，确保被保留的 tool_result 不会和它对应的 tool_use 被拆散——
     参见 `_align_keep_start_to_tool_pair`。
     """
+    # 这个函数决定 Layer 2 压缩时“从哪里切开”：
+    # 前缀做摘要，尾部原文保留。切得太靠前会回收太少空间，切得太靠后又会损失近期细节。
     n = len(messages)
     if n == 0:
         return 0
@@ -681,6 +953,7 @@ def _align_keep_start_to_tool_pair(messages: list[Message], keep_start: int) -> 
     （至少）配对的那条 assistant 消息，让 tool_use 与 tool_result 的配对关系保持完整。
     宁可多保留一对，也不要只保留半对（一个模型无法归属到任何调用的悬空 tool_result）。
     """
+    # 工具调用和工具结果最好成对保留，避免摘要边界把它们拆开后留下悬空结果。
     while 0 < keep_start < len(messages):
         msg = messages[keep_start]
         if msg.role == "user" and msg.tool_results:
@@ -706,6 +979,12 @@ def _prefix_too_small_to_compact(prefix: list[Message]) -> bool:
 
 @dataclass
 class CompactCircuitBreaker:
+    """自动压缩熔断器。
+
+    说明:
+        Layer 2 要调用 LLM 生成整段摘要，这一步成本更高，也可能连续失败。
+        熔断器的作用是在连续失败达到阈值后暂时停掉自动压缩，避免无意义重试。
+    """
     max_failures: int = 3
     consecutive_failures: int = field(default=0, init=False)
 
@@ -736,6 +1015,28 @@ async def auto_compact(
     tool_schemas: list[Mapping[str, Any]] | None = None,
     transcript_path: str = "",
 ) -> CompactEvent | str | None:
+    """执行 Layer 2 整段会话压缩。
+
+    输入:
+        conversation: 当前会话管理器。
+        client: 用于生成摘要的 LLM 客户端。
+        context_window: 当前模型上下文窗口大小。
+        session_dir: 工具结果落盘目录。
+        protocol: 当前协议类型。
+        manual: 是否手动触发压缩。
+        breaker: 自动压缩熔断器。
+        recovery: 压缩后恢复状态。
+        tool_schemas: 当前可用工具列表。
+        transcript_path: 压缩前完整会话记录路径。
+
+    输出:
+        成功时返回 `CompactEvent`；
+        失败或熔断时返回说明字符串；
+        当前无需压缩时返回 `None`。
+
+    说明:
+        这是整个模块最核心的编排函数：判断阈值、生成摘要、拼接恢复块、替换历史都在这里完成。
+    """
     threshold = compute_compact_threshold(context_window, manual=manual)
 
     # 以真实 API 用量为锚点做阈值判断：current_tokens() 返回上次计费基准
@@ -744,6 +1045,7 @@ async def auto_compact(
     current = conversation.current_tokens()
 
     if not manual and current < threshold:
+        # 自动模式没到阈值就直接跳过，避免过早用摘要替换仍然有价值的原文。
         return None
 
     if not manual and breaker is not None and breaker.is_open():
@@ -754,6 +1056,7 @@ async def auto_compact(
     # 决定保留多少尾部消息原文。只有前缀 messages[:keep_start] 会被摘要；
     # messages[keep_start:] 原样保留，让模型看到近期原文而非靠有损摘要复述。
     keep_start = _compute_keep_start_index(conversation.history)
+    # 这里只对较早前缀做摘要；`keep_tail` 代表最近的原文窗口，会原样保留。
     to_summarize = conversation.history[:keep_start]
     keep_tail = conversation.history[keep_start:]
 
@@ -802,6 +1105,7 @@ async def auto_compact(
         except Exception as e:
             err_msg = str(e).lower()
             if "prompt" in err_msg and "long" in err_msg or "too many" in err_msg:
+                # 失败时按轮次整体丢弃最老的 20%，避免把一轮工作拆散。
                 groups = _group_messages_by_turn(summary_conv.history[1:-1])
                 drop_count = max(1, len(groups) // 5)
                 remaining = groups[drop_count:]
@@ -829,6 +1133,7 @@ async def auto_compact(
         has_keep_tail=bool(keep_tail),
         transcript_path=transcript_path,
     )
+    # keep_tail 是近期原文窗口，这部分不摘要，直接拼回压缩后的历史。
     new_messages = new_messages + list(keep_tail)
 
     # replace_history 替换为重建后的对话并将用量锚点清零
